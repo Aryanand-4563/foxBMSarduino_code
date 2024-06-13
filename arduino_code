@@ -1,0 +1,297 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <EEPROM.h>
+#include <FreeRTOS.h>
+#include <task.h>
+#include <semphr.h>
+
+// ADC Configuration
+#define ADC_VBAT_VOLTAGE_DIVIDER    4.0f
+#define ADC_VREF_EXT                2.5f
+#define ADC_V25                     760.0f
+#define ADC_AVG_SLOPE               2.5f
+
+static uint16_t adc_vbat = 0;
+static uint16_t adc_mcuTemp = 0;
+
+// UART Configuration
+#define RXBUF_LENGTH 64
+#define TXBUF_LENGTH 64
+#define UART_COM_RECEIVEBUFFER_LENGTH 64
+
+#define MSG_NOT_BUSY 0
+#define MSG_BUSY 1
+
+typedef struct {
+    IRQn_Type IRQ;
+    uint8_t Prio;
+    uint8_t state;
+    uint8_t irqlock;
+} VIC_InterruptTypeDef;
+
+#define VIC_IRQ_ENABLE 1
+#define VIC_IRQ_DISABLE 0
+#define VIC_IRQ_LOCK_DISABLE 0
+
+VIC_InterruptTypeDef vic_interrupts[] = {
+    {UART_RX_IRQ, 2, VIC_IRQ_ENABLE, VIC_IRQ_LOCK_DISABLE} 
+};
+
+uint8_t vic_cfg_length = sizeof(vic_interrupts) / sizeof(VIC_InterruptTypeDef);
+
+volatile unsigned char Msg0SendBusy = MSG_NOT_BUSY;
+uint8_t rxbuf[RXBUF_LENGTH];
+uint8_t txbuf[TXBUF_LENGTH];
+
+uint8_t *wrpoi_rxbuf = rxbuf;
+uint8_t *rdpoi_rxbuf = rxbuf;
+
+uint8_t *wrpoi_txbuf = txbuf;
+uint8_t *rdpoi_txbuf = txbuf;
+
+char uart_com_receivedbyte[UART_COM_RECEIVEBUFFER_LENGTH];
+uint8_t uart_com_receive_slot = 0;
+
+SemaphoreHandle_t uartSemaphore;
+
+void ADC_Init() {
+    // ADC Initialization 
+}
+
+void ADC_Convert() {
+    adc_vbat = analogRead(A0);
+    adc_mcuTemp = analogRead(A1);
+}
+
+float ADC_GetVBAT_mV() {
+    float raw_voltage = adc_vbat * (ADC_VREF_EXT * 1000.0 / 1023.0);
+    return raw_voltage * ADC_VBAT_VOLTAGE_DIVIDER;
+}
+
+float ADC_GetMCUTemp_C() {
+    float raw_voltage = adc_mcuTemp * (ADC_VREF_EXT * 1000.0 / 1023.0);
+    float scaled_temperature = (raw_voltage - ADC_V25) / ADC_AVG_SLOPE + 25.0f;
+    return scaled_temperature;
+}
+
+void SPI_Init() {
+    SPI.begin();
+    Serial.println("SPI initialized.");
+}
+
+void BKP_SRAM_Init() {
+    if (EEPROM.read(0) != 1) {
+        for (int i = 0; i < EEPROM.length(); i++) {
+            EEPROM.write(i, 0);
+        }
+        EEPROM.write(0, 1); // Set data valid flag
+        Serial.println("Backup SRAM initialized.");
+    } else {
+        Serial.println("Backup SRAM already valid.");
+    }
+}
+
+uint8_t SPI_TransmitReceive(uint8_t data) {
+    digitalWrite(SS, LOW); // Enable slave
+    uint8_t receivedData = SPI.transfer(data);
+    digitalWrite(SS, HIGH);
+    return receivedData;
+}
+
+void UART_Init() {
+    Serial1.begin(9600);
+    uartSemaphore = xSemaphoreCreateBinary();
+    xSemaphoreGive(uartSemaphore);
+}
+
+void UART_IntRx() {
+    uint8_t received_char = Serial1.read();
+
+    *wrpoi_rxbuf = received_char;
+    if (++wrpoi_rxbuf >= &rxbuf[RXBUF_LENGTH]) {
+        wrpoi_rxbuf = rxbuf;
+    }
+
+    if (uart_com_receive_slot < UART_COM_RECEIVEBUFFER_LENGTH - 1) {
+        *(uart_com_receivedbyte + uart_com_receive_slot) = *rdpoi_rxbuf;
+        uart_com_receive_slot++;
+    }
+
+    if (++rdpoi_rxbuf >= &rxbuf[RXBUF_LENGTH]) {
+        rdpoi_rxbuf = rxbuf;
+    }
+}
+
+void UART_IntTx() {
+    if (rdpoi_txbuf >= &txbuf[TXBUF_LENGTH]) {
+        rdpoi_txbuf = txbuf;
+    }
+
+    if (rdpoi_txbuf != wrpoi_txbuf) {
+        Msg0SendBusy = MSG_BUSY;
+        Serial1.write(*rdpoi_txbuf++);
+    } else {
+        Msg0SendBusy = MSG_NOT_BUSY;
+    }
+}
+
+void UART_vWrite(const uint8_t *source) {
+    xSemaphoreTake(uartSemaphore, portMAX_DELAY);
+    wrpoi_txbuf = UART_txbuf_copy(wrpoi_txbuf, (uint8_t *)source);
+    if (Msg0SendBusy == MSG_NOT_BUSY) {
+        UART_IntTx();
+    }
+    xSemaphoreGive(uartSemaphore);
+}
+
+void UART_vWrite_intbuf(const uint8_t *source, uint16_t length) {
+    xSemaphoreTake(uartSemaphore, portMAX_DELAY);
+    wrpoi_txbuf = UART_txbuf_copy_length(wrpoi_txbuf, (uint8_t *)source, length);
+    if (Msg0SendBusy == MSG_NOT_BUSY) {
+        UART_IntTx();
+    }
+    xSemaphoreGive(uartSemaphore);
+}
+
+static uint8_t *UART_txbuf_copy(uint8_t *ptrb, uint8_t *ptra) {
+    uint8_t *tmpPtr = ptra;
+
+    while (*ptra) {
+        *ptrb++ = *ptra++;
+        if (ptrb >= &txbuf[TXBUF_LENGTH]) {
+            ptrb = txbuf;
+        }
+    }
+
+    while (*tmpPtr) {
+        *tmpPtr++ = 0;
+    }
+
+    return ptrb;
+}
+
+static uint8_t *UART_txbuf_copy_length(uint8_t *ptrb, uint8_t *ptra, uint16_t length) {
+    uint8_t *tmpPtr = ptra;
+    uint16_t tmp = 0;
+
+    while (tmp < length) {
+        *ptrb++ = *ptra++;
+        if (ptrb >= &txbuf[TXBUF_LENGTH]) {
+            ptrb = txbuf;
+        }
+        tmp++;
+    }
+
+    tmp = 0;
+    while (tmp < length) {
+        *tmpPtr++ = 0;
+        tmp++;
+    }
+
+    return ptrb;
+}
+
+void UART_Rx_Handler() {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    uint8_t received_char = Serial1.read();
+
+    *wrpoi_rxbuf = received_char;
+    if (++wrpoi_rxbuf >= &rxbuf[RXBUF_LENGTH]) {
+        wrpoi_rxbuf = rxbuf;
+    }
+
+    if (uart_com_receive_slot < UART_COM_RECEIVEBUFFER_LENGTH - 1) {
+        *(uart_com_receivedbyte + uart_com_receive_slot) = *rdpoi_rxbuf;
+        uart_com_receive_slot++;
+    }
+
+    if (++rdpoi_rxbuf >= &rxbuf[RXBUF_LENGTH]) {
+        rdpoi_rxbuf = rxbuf;
+    }
+
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+uint32_t VIC_PreOsInterruptInit(void) {
+    return 0;
+}
+
+uint32_t VIC_PostOsInterruptInit(void) {
+    uint32_t retErr = 0;
+
+    for (uint8_t i = 0; i < vic_cfg_length; i++) {
+        if (vic_interrupts[i].Prio > 15) {
+            retErr |= 1;
+        }
+    }
+
+    for (uint8_t i = 0; i < vic_cfg_length; i++) {
+        if (vic_interrupts[i].state == VIC_IRQ_ENABLE) {
+            VIC_EnableInterrupts(vic_interrupts[i].IRQ);
+        }
+    }
+
+    return retErr;
+}
+
+void VIC_EnableInterrupts(IRQn_Type interrupt) {
+    for (uint8_t i = 0; i < vic_cfg_length; i++) {
+        if (vic_interrupts[i].IRQ == interrupt && vic_interrupts[i].irqlock == VIC_IRQ_LOCK_DISABLE) {
+            vic_interrupts[i].state = VIC_IRQ_ENABLE;
+            attachInterrupt(digitalPinToInterrupt(interrupt), UART_Rx_Handler, CHANGE);
+        }
+    }
+}
+
+void VIC_DisableInterrupt(IRQn_Type interrupt) {
+    for (uint8_t i = 0; i < vic_cfg_length; i++) {
+        if (vic_interrupts[i].IRQ == interrupt && vic_interrupts[i].irqlock == VIC_IRQ_LOCK_DISABLE) {
+            vic_interrupts[i].state = VIC_IRQ_DISABLE;
+            detachInterrupt(digitalPinToInterrupt(interrupt));
+        }
+    }
+}
+
+void setup() {
+    Serial.begin(9600);
+    while (!Serial);
+
+    // Initialize ADC
+    ADC_Init();
+
+    // Initialize SPI
+    SPI_Init();
+
+    // Initialize backup RAM
+    BKP_SRAM_Init();
+
+    // Initialize UART
+    UART_Init();
+    VIC_PostOsInterruptInit();
+}
+
+void loop() {
+    // ADC conversion
+    ADC_Convert();
+    
+
+    Serial.print("VBAT (mV): ");
+    Serial.println(ADC_GetVBAT_mV());
+    Serial.print("MCU Temperature (C): ");
+    Serial.println(ADC_GetMCUTemp_C());
+
+    // SPI communication
+    uint8_t dataToSend = 0x55;
+    uint8_t dataReceived = SPI_TransmitReceive(dataToSend);
+    Serial.print("Received data: ");
+    Serial.println(dataReceived, HEX);
+
+    // UART communication
+    if (Serial.available()) {
+        UART_IntRx();
+    }
+
+    delay(1000); // Adjust delay as necessary
+}
+
+
